@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ChatServer
@@ -26,12 +27,14 @@ namespace ChatServer
         public long Ts { get; set; }             // timestamp
     }
 
-    public class ChatServer
+    public class ChatServer : IDisposable
     {
         private TcpListener _server;
-        private List<ClientInfo> _clients = new List<ClientInfo>();
+        private readonly List<ClientInfo> _clients = new List<ClientInfo>();
         private readonly object _lock = new object();
         private bool _isRunning = false;
+        private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
+        private readonly SemaphoreSlim _connectionSemaphore = new SemaphoreSlim(100, 100); // Max 100 concurrent clients
 
         public event EventHandler<string> ServerMessage;
 
@@ -47,14 +50,34 @@ namespace ChatServer
                 OnServerMessage("Waiting for connections...");
 
                 // Handle server commands in background
-                _ = Task.Run(HandleServerCommands);
+                _ = Task.Run(() => HandleServerCommands(_cancellationTokenSource.Token));
 
-                while (_isRunning)
+                while (_isRunning && !_cancellationTokenSource.Token.IsCancellationRequested)
                 {
                     try
                     {
                         var client = await _server.AcceptTcpClientAsync();
-                        _ = Task.Run(() => HandleClient(client));
+                        
+                        // Check connection limit
+                        if (await _connectionSemaphore.WaitAsync(0))
+                        {
+                            _ = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    await HandleClient(client, _cancellationTokenSource.Token);
+                                }
+                                finally
+                                {
+                                    _connectionSemaphore.Release();
+                                }
+                            });
+                        }
+                        else
+                        {
+                            OnServerMessage("Connection limit reached, rejecting client");
+                            client.Close();
+                        }
                     }
                     catch (ObjectDisposedException)
                     {
@@ -76,6 +99,7 @@ namespace ChatServer
         public void Stop()
         {
             _isRunning = false;
+            _cancellationTokenSource.Cancel();
             _server?.Stop();
             
             // Disconnect all clients
@@ -95,7 +119,7 @@ namespace ChatServer
             OnServerMessage("Server stopped");
         }
 
-        private async Task HandleClient(TcpClient client)
+        private async Task HandleClient(TcpClient client, CancellationToken cancellationToken)
         {
             ClientInfo clientInfo = null;
             string clientId = Guid.NewGuid().ToString()[..8];
@@ -115,7 +139,7 @@ namespace ChatServer
                 await SendMessage(welcomeMsg, stream);
 
                 // Wait for username (join message)
-                var joinMessage = await ReceiveMessage(stream);
+                var joinMessage = await ReceiveMessage(stream, cancellationToken);
                 if (joinMessage == null)
                 {
                     client.Close();
@@ -180,17 +204,21 @@ namespace ChatServer
                 await SendMemberListToClient(clientInfo);
 
                 // Main message handling loop
-                while (client.Connected && _isRunning)
+                while (client.Connected && _isRunning && !cancellationToken.IsCancellationRequested)
                 {
-                    var message = await ReceiveMessage(stream);
+                    var message = await ReceiveMessage(stream, cancellationToken);
                     if (message == null) break;
 
                     await ProcessMessage(message, clientInfo);
                 }
             }
+            catch (Exception ex) when (ex is System.IO.IOException || ex is SocketException)
+            {
+                // Client disconnected - this is normal
+            }
             catch (Exception ex)
             {
-                OnServerMessage($"Error with client {clientId}: {ex.Message}");
+                OnServerMessage($"Unexpected error with client {clientId}: {ex.Message}");
             }
             finally
             {
@@ -198,7 +226,11 @@ namespace ChatServer
                 {
                     await HandleClientDisconnect(clientInfo);
                 }
-                client?.Close();
+                try
+                {
+                    client?.Close();
+                }
+                catch { /* Ignore cleanup errors */ }
             }
         }
 
@@ -343,19 +375,21 @@ namespace ChatServer
             }
         }
 
-        private async Task<ChatMessage> ReceiveMessage(NetworkStream stream)
+        private async Task<ChatMessage> ReceiveMessage(NetworkStream stream, CancellationToken cancellationToken = default)
         {
             try
             {
                 // Read message length first (4 bytes)
                 byte[] lengthBytes = new byte[4];
                 int bytesRead = 0;
-                while (bytesRead < 4)
+                while (bytesRead < 4 && !cancellationToken.IsCancellationRequested)
                 {
-                    int read = await stream.ReadAsync(lengthBytes, bytesRead, 4 - bytesRead);
+                    int read = await stream.ReadAsync(lengthBytes, bytesRead, 4 - bytesRead, cancellationToken);
                     if (read == 0) return null; // Connection closed
                     bytesRead += read;
                 }
+
+                if (cancellationToken.IsCancellationRequested) return null;
 
                 int messageLength = BitConverter.ToInt32(lengthBytes, 0);
                 if (messageLength <= 0 || messageLength > 65536) // Sanity check
@@ -367,19 +401,30 @@ namespace ChatServer
                 // Read the actual message
                 byte[] messageBytes = new byte[messageLength];
                 bytesRead = 0;
-                while (bytesRead < messageLength)
+                while (bytesRead < messageLength && !cancellationToken.IsCancellationRequested)
                 {
-                    int read = await stream.ReadAsync(messageBytes, bytesRead, messageLength - bytesRead);
+                    int read = await stream.ReadAsync(messageBytes, bytesRead, messageLength - bytesRead, cancellationToken);
                     if (read == 0) return null; // Connection closed
                     bytesRead += read;
                 }
 
+                if (cancellationToken.IsCancellationRequested) return null;
+
                 string jsonData = Encoding.UTF8.GetString(messageBytes);
                 return JsonSerializer.Deserialize<ChatMessage>(jsonData);
             }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
+            catch (Exception ex) when (ex is System.IO.IOException || ex is SocketException)
+            {
+                // Client disconnected - this is normal, don't log as error
+                return null;
+            }
             catch (Exception ex)
             {
-                OnServerMessage($"Error receiving message: {ex.Message}");
+                OnServerMessage($"Unexpected error receiving message: {ex.Message}");
                 return null;
             }
         }
@@ -403,13 +448,13 @@ namespace ChatServer
             OnServerMessage($"[{DateTime.Now}] {clientInfo.Username} disconnected");
         }
 
-        private async Task HandleServerCommands()
+        private async Task HandleServerCommands(CancellationToken cancellationToken)
         {
-            while (_isRunning)
+            while (_isRunning && !cancellationToken.IsCancellationRequested)
             {
                 try
                 {
-                    string command = await Task.Run(() => Console.ReadLine());
+                    string command = await Task.Run(() => Console.ReadLine(), cancellationToken);
                     
                     if (command == "/list")
                     {
@@ -440,12 +485,23 @@ namespace ChatServer
                         OnServerMessage("Unknown command. Type /help for available commands.");
                     }
                 }
+                catch (OperationCanceledException) 
+                {
+                    break;
+                }
                 catch (Exception ex)
                 {
                     OnServerMessage($"Error in command handler: {ex.Message}");
                 }
                 
-                await Task.Delay(100);
+                try
+                {
+                    await Task.Delay(100, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
             }
         }
 
@@ -458,6 +514,23 @@ namespace ChatServer
         {
             Console.WriteLine(message);
             ServerMessage?.Invoke(this, message);
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                Stop();
+                _cancellationTokenSource?.Dispose();
+                _connectionSemaphore?.Dispose();
+                _server?.Stop();
+            }
         }
     }
 }
